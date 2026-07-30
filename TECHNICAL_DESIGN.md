@@ -144,27 +144,188 @@ No full log bodies in the journal. Example row:
 
 ## 3. Architecture
 
-*TBD*
+PipeDebug is a **single Go binary** on the developer machine. It orchestrates Docker (where CI steps actually run) and optionally an LLM API (for scoped auto-fixes). There is no hosted backend or multi-service mesh.
+
+### High-level design
+
+```
+┌─────────────┐     parse      ┌──────────────────┐
+│ CI YAML     │ ─────────────► │ Job / Step model │
+└─────────────┘                └────────┬─────────┘
+                                        │
+                                        ▼
+┌─────────────┐   mount repo   ┌──────────────────┐
+│ Docker      │ ◄─────────────│ Runner executor  │
+│ (parity)    │   run steps    └────────┬─────────┘
+└─────────────┘                         │
+                         pass ──────────┤──► journal row → done
+                                   fail │
+                                        ▼
+                               ┌──────────────────┐
+                               │ Failure artifact │
+                               └────────┬─────────┘
+                                        ▼
+                               ┌──────────────────┐
+                               │ LLM agent        │
+                               │ (scope gate +    │
+                               │  patch propose)  │
+                               └────────┬─────────┘
+                          escalate ─────┤──► journal row → stop
+                                        │ apply patch
+                                        ▼
+                               re-enter executor (loop)
+```
+
+Same flow as the PRD, with journal write on terminal outcomes (pass, escalate, max iterations).
 
 ### System context diagram
 
+What exists outside the binary, and how the user interacts with it:
+
+```mermaid
+flowchart LR
+  Dev[Developer] -->|CLI commands| PD[pipedebug binary]
+  PD -->|read CI YAML + source| Repo[Local git repo]
+  PD -->|append summary row| Journal[.pipedebug/history.md]
+  PD -->|create/run containers<br/>mount workspace| Docker[Docker Engine]
+  Docker -->|execute steps| Ctr[Runner container]
+  Ctr -->|read/write via mount| Repo
+  PD -->|failure context / patch request| LLM[LLM API]
+  LLM -->|scoped patch + rationale| PD
+```
+
+**Trust / data notes**
+- Secrets and env files stay on the host; injected into the container for the run; never written into the journal
+- Failure tails + relevant file snippets are sent to the LLM when AI is enabled; full repo is not uploaded by default
+- The container sees the mounted working tree (same files the developer is editing)
+
 ### Component diagram
 
+Internal packages inside the Go module (logical components, one process):
+
+```mermaid
+flowchart TB
+  CLI[cmd/pipedebug<br/>CLI / flags / exit codes]
+
+  subgraph core [Core library]
+    Parse[parser<br/>CI YAML → Job/Step IR]
+    Img[image<br/>runs-on → Docker image]
+    Exec[executor<br/>Docker lifecycle + step runner + log UX]
+    Loop[debugloop<br/>iterate: fail → gate → patch → re-run]
+    Gate[scopegate<br/>minor vs escalate]
+    Patch[patcher<br/>apply / rollback diffs]
+    Fail[failure<br/>package bounded context]
+    LLMClient[llm<br/>HTTP client]
+    Journal[journal<br/>append history.md row]
+  end
+
+  CLI --> Parse
+  CLI --> Loop
+  Parse --> Img
+  Loop --> Exec
+  Loop --> Fail
+  Loop --> Gate
+  Loop --> Patch
+  Loop --> LLMClient
+  Loop --> Journal
+  Exec --> Img
+  Gate --> LLMClient
+  Fail --> LLMClient
+```
+
+**Happy-path control flow (AI on)**
+
+1. CLI resolves repo path, flags (`--job`, `--max-iterations`, `--no-ai`, `--verbose`)
+2. `parser` loads workflow → job/step IR; `image` resolves runner image
+3. `executor` runs steps in Docker; buffers per-step logs; prints progress / failure tail
+4. On success → `journal` append → exit 0
+5. On failure + AI enabled → `failure` packages context → `scopegate` (+ LLM) classifies
+6. If minor → `llm` proposes patch → `patcher` applies → back to step 3
+7. If escalate / max iterations → `journal` append → non-zero exit (no auto-commit)
+
 ### Service boundaries
+
+Not separate deployable services—**package boundaries** with clear ownership. Crossing them the wrong way is what creates spaghetti later.
+
+| Boundary | Owns | Must not own |
+|----------|------|--------------|
+| `cmd/pipedebug` | Flags, UX copy, process exit codes | Docker details, YAML schema, LLM prompts |
+| `parser` | Provider YAML → normalized **Job/Step IR** | Running containers, calling LLM |
+| `image` | Mapping `runs-on` / overrides → image ref | Step execution |
+| `executor` | Container create/mount/run/cleanup; log buffer + terminal Log UX | Patching files, LLM calls, journal format |
+| `failure` | Bounded failure artifact (step, exit, log tail, snippets) | Deciding whether to fix |
+| `scopegate` | Minor vs out-of-scope decision | Applying patches |
+| `llm` | Provider HTTP, retries, response parse into a patch DTO | File I/O |
+| `patcher` | Apply/rollback unified diffs within allowlist | Re-running CI |
+| `debugloop` | Orchestration + iteration limits + stop reasons | Provider-specific YAML parsing |
+| `journal` | Append one history row | Storing full logs |
+
+**External boundaries**
+| External | Interface | Failure mode |
+|----------|-----------|--------------|
+| Docker Engine | API or CLI wrapper behind `executor` | Clear error if daemon down / image pull fails (`doctor` later) |
+| LLM API | HTTPS JSON behind `llm` | On error: stop loop, keep last good tree, tell user |
+| Repo filesystem | Read CI + source; write only via `patcher` | Refuse writes outside allowlist |
+
+**IR (anti-corruption layer)**  
+Parsers convert GitHub Actions (later GitLab/CircleCI) into one internal model. `executor` and `debugloop` only speak IR—so new CI providers are new parsers, not forks of the run loop.
 
 ---
 
 ## 4. Data Design
 
-*TBD*
+No relational database. Almost all state is **ephemeral in-process** for a single `pipedebug run`. The only durable artifact is the append-only run journal (plus optional `--keep-logs` files later).
 
 ### Entities
 
+In-memory / on-disk concepts the Go code cares about:
+
+| Entity | Lifetime | Description |
+|--------|----------|-------------|
+| **Job** | Per run | Normalized IR: name, image, env, ordered steps |
+| **Step** | Per run | Name, command(s), working directory, env overlays |
+| **RunResult** | Per attempt | Pass/fail, failed step id, duration, iteration index |
+| **FailureArtifact** | Per failed attempt | Exit code, log tail, relevant file/YAML snippets (bounded) |
+| **PatchProposal** | Per AI iteration | Unified diff, rationale, target paths, scope decision |
+| **JournalEntry** | Durable | One summary row appended when a top-level run finishes |
+
+Source of truth for product code remains the **user working tree**; PipeDebug does not maintain a parallel code datastore.
+
 ### Database schema
+
+**N/A — no database.**
+
+**Persisted file:** `.pipedebug/history.md` (gitignored)
+
+| Column | Type (logical) | Notes |
+|--------|----------------|-------|
+| `timestamp` | string (UTC ISO-8601) | Run end time |
+| `workflow` | string | Workflow file or id |
+| `job` | string | Job name |
+| `status` | enum | `passed` \| `failed` \| `escalated` \| `max_iterations` |
+| `failed_step` | string | Empty if passed |
+| `iterations` | int | Auto-debug attempts used |
+| `files_changed` | string | Short list or count of patched paths |
+| `duration` | string | Wall time, e.g. `47s` |
+| `ai` | enum | `on` \| `off` |
+
+Header + one Markdown table row appended per completed CLI invocation. No full logs in this file.
+
+Optional later (P1): `.pipedebug/logs/<run-id>.log` when `--keep-logs` is set; retain last N files only.
 
 ### Relationships
 
+```
+Job 1──* Step
+Job 1──* RunResult          (one per executor attempt / loop iteration)
+RunResult 0..1──1 FailureArtifact   (only on failure)
+FailureArtifact 0..1──1 PatchProposal (only if AI proposes a fix)
+CLI run 1──1 JournalEntry   (written once at the end)
+PatchProposal *──▸ file paths in working tree (applied/rolled back; not stored as blobs)
+```
+
 ---
+
 
 ## 5. API Design
 
