@@ -27,14 +27,13 @@ This document describes how the system will be built: components, data, APIs, te
 - Step-through mode, `pipedebug doctor`, image override
 - Patch preview/rollback
 - GitLab CI / CircleCI parsers
-- Optional `--keep-logs` (retain last N full log files with rotation)
 
 **Out of scope (for this project)**
 - Replacing hosted CI as the merge/deploy source of truth
 - Full emulation of every marketplace action, OIDC, or proprietary runner feature
 - LLM-driven architecture or product redesigns
 - Interactive web dashboard / hosted multi-tenant UI (see §2 — demo via CLI + README instead)
-- Persisting full step logs by default
+- Persisting full step logs (stream is capped to a tail buffer; no log archive in MVP)
 
 ### Key requirements from PRD
 
@@ -56,7 +55,7 @@ This document describes how the system will be built: components, data, APIs, te
 | Language | Go | Strong CLI + Docker ecosystem fit; single static binary is easy to install and demo |
 | UI | No dashboard | Core product is terminal feedback; a SPA would dilute scope. Hiring managers rarely run full local stacks—README + short demo recording + clean CLI matters more |
 | Persistence | Append-only run journal (Markdown table) | One summary row per run; no full logs by default → tiny disk footprint, human-readable, `git`-friendly to ignore |
-| Log UX | Live progress in terminal; full step output buffered (not dumped); on failure show **tail** of failing step; optional `--verbose` / `--keep-logs` | Avoid flooding the terminal or disk; still enough context for humans + LLM |
+| Log UX | Live progress in terminal; keep only a **capped tail** of each step (drop older lines); on failure show that tail; optional `--verbose` | Avoid flooding terminal/RAM; enough context for humans + LLM without dual spool systems |
 
 ---
 
@@ -95,14 +94,13 @@ Pipeline execution always happens **inside Docker**; the Go process is the orche
 | Artifact | Location (default) | Contents |
 |----------|--------------------|----------|
 | Run journal | `.pipedebug/history.md` in the target repo (gitignored) | Markdown table; **one new row appended per run** |
-| Optional logs | `.pipedebug/logs/` (only with `--keep-logs`, P1) | Full step logs; retain last N runs, delete older |
-| In-memory / temp buffer | Per-step during a run | Used for failure packaging to the LLM and for printing a failure tail; discarded when the run ends unless `--keep-logs` |
+| Step tail buffer | In-process, per step | Ring/capped buffer of last N lines or ~256KB; discarded when the run ends |
 
 **Default terminal output (not a raw dump of every line):**
 - Step start/end lines and pass/fail status as the job runs (live progress)
 - Successful steps: summary only (no full stdout), unless `--verbose`
-- Failed step: print the **last N lines** (e.g. 50–100) of that step’s output, plus exit code
-- AI loop: short rationale + diff summary, not a second copy of the full log
+- Failed step: print the capped tail already held in memory, plus exit code
+- AI loop: short rationale + diff summary, not a second copy of the log
 
 **Journal row fields (relevant, minimal):**
 
@@ -274,7 +272,19 @@ Parsers convert GitHub Actions (later GitLab/CircleCI) into one internal model. 
 
 ## 4. Data Design
 
-No relational database. Almost all state is **ephemeral in-process** for a single `pipedebug run`. The only durable artifact is the append-only run journal (plus optional `--keep-logs` files later).
+No relational database. Almost all state is **ephemeral in-process** for a single `pipedebug run`. The only durable artifact is the append-only run journal.
+
+### Intermediate log storage (for the LLM)
+
+When a step fails, the LLM needs failure context — so logs are **captured during the run**, not only printed. Real CI logs can be huge, so we **only keep a capped tail**.
+
+| Layer | What | Lifetime |
+|-------|------|----------|
+| **Step tail buffer** | Single in-memory ring/capped buffer per step: last ~100–200 lines or ~256KB; older output discarded as new lines arrive | Dropped when the step finishes or the run ends |
+| **FailureArtifact** | Exit code, that capped tail, step name, relevant file/YAML snippets | Lives for the AI iteration, then dropped |
+| **Journal** | One summary row | Durable; **no** log body |
+
+No temp log files and no dual spool+ring system in MVP. If we later need full archives (`--keep-logs`), tee the stream to a file then—don’t build it now.
 
 ### Entities
 
@@ -284,8 +294,9 @@ In-memory / on-disk concepts the Go code cares about:
 |--------|----------|-------------|
 | **Job** | Per run | Normalized IR: name, image, env, ordered steps |
 | **Step** | Per run | Name, command(s), working directory, env overlays |
+| **StepTailBuffer** | Per step / attempt | Capped in-memory tail of stdout/stderr; source for failure display + LLM context |
 | **RunResult** | Per attempt | Pass/fail, failed step id, duration, iteration index |
-| **FailureArtifact** | Per failed attempt | Exit code, log tail, relevant file/YAML snippets (bounded) |
+| **FailureArtifact** | Per failed attempt | Exit code, log tail, relevant file/YAML snippets (bounded) — built from `StepTailBuffer` |
 | **PatchProposal** | Per AI iteration | Unified diff, rationale, target paths, scope decision |
 | **JournalEntry** | Durable | One summary row appended when a top-level run finishes |
 
@@ -311,16 +322,15 @@ Source of truth for product code remains the **user working tree**; PipeDebug do
 
 Header + one Markdown table row appended per completed CLI invocation. No full logs in this file.
 
-Optional later (P1): `.pipedebug/logs/<run-id>.log` when `--keep-logs` is set; retain last N files only.
-
 ### Relationships
 
 ```
 Job 1──* Step
-Job 1──* RunResult          (one per executor attempt / loop iteration)
-RunResult 0..1──1 FailureArtifact   (only on failure)
+Step 1──0..1 StepTailBuffer         (capped tail while step runs)
+Job 1──* RunResult                  (one per executor attempt / loop iteration)
+RunResult 0..1──1 FailureArtifact   (only on failure; derived from StepTailBuffer)
 FailureArtifact 0..1──1 PatchProposal (only if AI proposes a fix)
-CLI run 1──1 JournalEntry   (written once at the end)
+CLI run 1──1 JournalEntry           (written once at the end; no log body)
 PatchProposal *──▸ file paths in working tree (applied/rolled back; not stored as blobs)
 ```
 
