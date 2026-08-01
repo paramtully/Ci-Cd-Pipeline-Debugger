@@ -339,15 +339,137 @@ PatchProposal *──▸ file paths in working tree (applied/rolled back; not st
 
 ## 5. API Design
 
-*TBD*
+PipeDebug does **not** expose a hosted REST/HTTP API in MVP. The user-facing interface is the **CLI**. Externally, the binary is a **client** of Docker and an LLM HTTP API. Internally, packages talk through small Go interfaces (test seams).
 
 ### Endpoints
 
+#### User-facing: CLI
+
+| Command | Purpose |
+|---------|---------|
+| `pipedebug run` | Parse CI config, run job in Docker, optional AI loop, append journal row |
+| `pipedebug doctor` | P1 — check Docker, image pull, config parse |
+
+**`pipedebug run` flags (MVP)**
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--workflow` | auto-detect | Workflow file path |
+| `--job` | required if ambiguous | Job name to run |
+| `--no-ai` / `--fix` | AI on | Skip LLM auto-debug |
+| `--max-iterations` | `3` | Cap AI fix attempts |
+| `--verbose` | off | Stream full step output to terminal |
+| `--image` | from `runs-on` map | Override runner image |
+| `--env-file` | none | Inject secrets/env into container |
+| `--yes` | off | P1 — auto-apply patches without diff confirmation |
+
+**Exit codes**
+
+| Code | Meaning |
+|------|---------|
+| `0` | Job passed (with or without AI fixes) |
+| `1` | Job failed / escalated / max iterations |
+| `2` | Usage / config error (bad flags, unparseable YAML) |
+| `3` | Environment error (Docker unavailable, image pull failed, missing LLM key when AI on) |
+
+#### External: LLM (outbound HTTP)
+
+OpenAI-compatible Chat Completions (provider swappable via base URL + model env).
+
+| Method | Path | Role |
+|--------|------|------|
+| `POST` | `{base}/v1/chat/completions` | Scope classification + patch proposal |
+
+One logical “fix” request per failed iteration (classification can be the same call that returns a patch or `escalate`).
+
+#### External: Docker (outbound local)
+
+Not REST in our public API sense — `executor` talks to the local Docker Engine (SDK or `docker` CLI wrapper):
+
+- create/start container, bind-mount repo, set env, attach logs, wait, remove
+
+#### Not in MVP
+
+- No `localhost` HTTP server for the CLI
+- No dashboard REST API
+- No webhook receivers
+
 ### Request/response formats
+
+#### CLI → user (stdout/stderr)
+
+Structured for humans, stable enough to grep:
+
+```text
+→ step "Install deps"
+✗ step "Install deps" failed (exit 1)
+--- log tail ---
+...
+--- end ---
+🤖 minor fix: typo in package name (package.json)
+applied 1 file; re-running (iteration 2/3)
+✓ job build passed after 2 iteration(s)
+```
+
+Machine-oriented detail stays in `.pipedebug/history.md` (one row), not a JSON API.
+
+#### LLM request (conceptual)
+
+JSON body to chat completions including:
+
+- System: scope rules (minor vs escalate; no architecture changes; return patch or escalate)
+- User: `FailureArtifact` fields — job/step name, exit code, capped log tail, relevant file/YAML snippets, allowlisted paths
+
+**Expected LLM response (parsed into `PatchProposal`)**
+
+```json
+{
+  "decision": "fix" | "escalate",
+  "rationale": "string",
+  "files": [
+    { "path": "relative/path", "unified_diff": "..." }
+  ]
+}
+```
+
+If `decision` is `escalate`, `files` is empty and the loop stops. Invalid JSON / paths outside allowlist → treat as failure of that iteration (no apply, or rollback).
+
+#### Internal Go interfaces (package API)
+
+Stable seams for unit tests; not network endpoints:
+
+```go
+type Executor interface {
+    Run(ctx context.Context, job Job) (RunResult, error)
+}
+
+type LLMClient interface {
+    ProposeFix(ctx context.Context, failure FailureArtifact) (PatchProposal, error)
+}
+
+type Patcher interface {
+    Apply(ctx context.Context, proposal PatchProposal) (applied []string, err error)
+    Rollback(ctx context.Context) error
+}
+
+type Journal interface {
+    Append(entry JournalEntry) error
+}
+```
 
 ### Authentication
 
+| Surface | Auth |
+|---------|------|
+| CLI | None (local process; user already has filesystem access) |
+| Docker Engine | Local daemon access (default socket / Docker context); no PipeDebug-managed credentials |
+| LLM API | API key via env, e.g. `PIPEDEBUG_LLM_API_KEY` (or provider-specific); optional `PIPEDEBUG_LLM_BASE_URL`, `PIPEDEBUG_LLM_MODEL` |
+| Secrets for CI steps | User-supplied `--env-file` / flags; injected into container only; never sent to the LLM or written to the journal |
+
+If AI is enabled and the LLM key is missing → exit `3` with a clear message. `--no-ai` does not require a key.
+
 ---
+
 
 ## 6. Component Design
 
