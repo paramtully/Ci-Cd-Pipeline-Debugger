@@ -78,11 +78,11 @@ A full dashboard is only useful later if users need to browse many historical ru
 
 | Layer | Role |
 |-------|------|
-| `cmd/pipedebug` | Cobra (or stdlib `flag`) CLI: `run`, later `doctor` |
-| Config / CI parsers | YAML → normalized job/step model (GitHub Actions first) |
-| Executor | Docker Engine API or `docker` CLI wrapper: create container, mount repo, run steps; capture step logs with controlled terminal output (see Log UX) |
-| Auto-debug loop | Failure packager, scope gate, patch apply/rollback, re-run orchestration |
-| LLM client | HTTP client to a chat/completions API (provider configurable via env) |
+| `cmd/pipedebug` | Parse argv → typed `Config`; subcommands `run` (P1: `doctor`); wire deps; exit codes |
+| CI parser | YAML → `Job` (GitHub Actions first) |
+| `DockerRunner` | Concrete `Executor`: Docker Engine API (preferred) or `docker` CLI; mount repo, run steps, capped log tail |
+| `loop` | fail → LLM propose → patch → re-run |
+| LLM client | HTTP chat/completions → `PatchProposal` |
 | Journal | Append one summary row per completed run |
 
 Pipeline execution always happens **inside Docker**; the Go process is the orchestrator on the host.
@@ -205,68 +205,55 @@ Internal packages inside the Go module (logical components, one process):
 flowchart TB
   CLI[cmd/pipedebug<br/>CLI / flags / exit codes]
 
-  subgraph core [Core library]
-    Parse[parser<br/>CI YAML → Job/Step IR]
-    Img[image<br/>runs-on → Docker image]
-    Exec[executor<br/>Docker lifecycle + step runner + log UX]
-    Loop[debugloop<br/>iterate: fail → gate → patch → re-run]
-    Gate[scopegate<br/>minor vs escalate]
-    Patch[patcher<br/>apply / rollback diffs]
-    Fail[failure<br/>package bounded context]
-    LLMClient[llm<br/>HTTP client]
-    Journal[journal<br/>append history.md row]
+  subgraph core [internal]
+    Parse[parser<br/>CI YAML → Job]
+    Exec[executor<br/>DockerRunner + capped log tail]
+    Loop[loop<br/>fail → LLM → patch → re-run]
+    Patch[patcher]
+    LLMClient[llm]
+    Journal[journal]
   end
 
   CLI --> Parse
   CLI --> Loop
-  Parse --> Img
   Loop --> Exec
-  Loop --> Fail
-  Loop --> Gate
-  Loop --> Patch
   Loop --> LLMClient
+  Loop --> Patch
   Loop --> Journal
-  Exec --> Img
-  Gate --> LLMClient
-  Fail --> LLMClient
 ```
 
 **Happy-path control flow (AI on)**
 
-1. CLI resolves repo path, flags (`--job`, `--max-iterations`, `--no-ai`, `--verbose`)
-2. `parser` loads workflow → job/step IR; `image` resolves runner image
-3. `executor` runs steps in Docker; buffers per-step logs; prints progress / failure tail
+1. CLI resolves repo path and flags
+2. `parser` loads workflow → `Job` (including image mapping / `--image`)
+3. `executor` runs steps in Docker; keeps capped log tail; prints progress / failure tail
 4. On success → `journal` append → exit 0
-5. On failure + AI enabled → `failure` packages context → `scopegate` (+ LLM) classifies
-6. If minor → `llm` proposes patch → `patcher` applies → back to step 3
+5. On failure + AI enabled → `llm` gets tail + snippets → `fix` or `escalate`
+6. If fix → `patcher` applies → back to step 3
 7. If escalate / max iterations → `journal` append → non-zero exit (no auto-commit)
 
 ### Service boundaries
 
-Not separate deployable services—**package boundaries** with clear ownership. Crossing them the wrong way is what creates spaghetti later.
+Package boundaries (one process—not microservices):
 
 | Boundary | Owns | Must not own |
 |----------|------|--------------|
-| `cmd/pipedebug` | Flags, UX copy, process exit codes | Docker details, YAML schema, LLM prompts |
-| `parser` | Provider YAML → normalized **Job/Step IR** | Running containers, calling LLM |
-| `image` | Mapping `runs-on` / overrides → image ref | Step execution |
-| `executor` | Container create/mount/run/cleanup; log buffer + terminal Log UX | Patching files, LLM calls, journal format |
-| `failure` | Bounded failure artifact (step, exit, log tail, snippets) | Deciding whether to fix |
-| `scopegate` | Minor vs out-of-scope decision | Applying patches |
-| `llm` | Provider HTTP, retries, response parse into a patch DTO | File I/O |
-| `patcher` | Apply/rollback unified diffs within allowlist | Re-running CI |
-| `debugloop` | Orchestration + iteration limits + stop reasons | Provider-specific YAML parsing |
-| `journal` | Append one history row | Storing full logs |
+| `cmd/pipedebug` | Flags, UX copy, exit codes, wiring | Docker/LLM details |
+| `parser` | YAML → `Job` (+ image mapping) | Running containers, LLM |
+| `executor` | Docker lifecycle, capped tail, log UX | Patching, LLM, journal format |
+| `llm` | HTTP + parse `PatchProposal` | File I/O |
+| `patcher` | Allowlisted apply/rollback | Re-running CI |
+| `loop` | Iterations + stop reasons | Provider-specific YAML |
+| `journal` | One history row | Full logs |
 
 **External boundaries**
 | External | Interface | Failure mode |
 |----------|-----------|--------------|
-| Docker Engine | API or CLI wrapper behind `executor` | Clear error if daemon down / image pull fails (`doctor` later) |
-| LLM API | HTTPS JSON behind `llm` | On error: stop loop, keep last good tree, tell user |
-| Repo filesystem | Read CI + source; write only via `patcher` | Refuse writes outside allowlist |
+| Docker Engine | Behind `Executor` interface | Clear error if daemon down / pull fails |
+| LLM API | Behind `LLMClient` interface | Stop loop, keep tree, tell user |
+| Repo filesystem | Writes only via `patcher` | Refuse paths outside allowlist |
 
-**IR (anti-corruption layer)**  
-Parsers convert GitHub Actions (later GitLab/CircleCI) into one internal model. `executor` and `debugloop` only speak IR—so new CI providers are new parsers, not forks of the run loop.
+**IR:** Parsers produce one internal `Job` model. `executor` / `loop` only speak that model—new CI providers = new parser code, not a forked run loop.
 
 ---
 
@@ -280,25 +267,21 @@ When a step fails, the LLM needs failure context — so logs are **captured duri
 
 | Layer | What | Lifetime |
 |-------|------|----------|
-| **Step tail buffer** | Single in-memory ring/capped buffer per step: last ~100–200 lines or ~256KB; older output discarded as new lines arrive | Dropped when the step finishes or the run ends |
-| **FailureArtifact** | Exit code, that capped tail, step name, relevant file/YAML snippets | Lives for the AI iteration, then dropped |
+| **Capped log tail** | In-memory ring inside `executor`: last ~100–200 lines or ~256KB | Dropped when the step/run ends |
+| **RunResult** | Pass/fail, failed step, exit code, that tail | Per executor attempt |
 | **Journal** | One summary row | Durable; **no** log body |
 
-No temp log files and no dual spool+ring system in MVP. If we later need full archives (`--keep-logs`), tee the stream to a file then—don’t build it now.
+No temp log files in MVP. Snippets for the LLM are read ad hoc from the workspace when building the `ProposeFix` call—not a separate persisted entity.
 
 ### Entities
 
-In-memory / on-disk concepts the Go code cares about:
-
 | Entity | Lifetime | Description |
 |--------|----------|-------------|
-| **Job** | Per run | Normalized IR: name, image, env, ordered steps |
-| **Step** | Per run | Name, command(s), working directory, env overlays |
-| **StepTailBuffer** | Per step / attempt | Capped in-memory tail of stdout/stderr; source for failure display + LLM context |
-| **RunResult** | Per attempt | Pass/fail, failed step id, duration, iteration index |
-| **FailureArtifact** | Per failed attempt | Exit code, log tail, relevant file/YAML snippets (bounded) — built from `StepTailBuffer` |
-| **PatchProposal** | Per AI iteration | Unified diff, rationale, target paths, scope decision |
-| **JournalEntry** | Durable | One summary row appended when a top-level run finishes |
+| **Job** | Per run | Name, image, ordered steps |
+| **Step** | Per run | Name + command (`run`) |
+| **RunResult** | Per attempt | Pass/fail, failed step, exit code, capped log tail |
+| **PatchProposal** | Per AI iteration | `fix` \| `escalate`, rationale, path→diff map |
+| **JournalEntry** | Durable | One summary row when the CLI run finishes |
 
 Source of truth for product code remains the **user working tree**; PipeDebug does not maintain a parallel code datastore.
 
@@ -326,12 +309,10 @@ Header + one Markdown table row appended per completed CLI invocation. No full l
 
 ```
 Job 1──* Step
-Step 1──0..1 StepTailBuffer         (capped tail while step runs)
-Job 1──* RunResult                  (one per executor attempt / loop iteration)
-RunResult 0..1──1 FailureArtifact   (only on failure; derived from StepTailBuffer)
-FailureArtifact 0..1──1 PatchProposal (only if AI proposes a fix)
-CLI run 1──1 JournalEntry           (written once at the end; no log body)
-PatchProposal *──▸ file paths in working tree (applied/rolled back; not stored as blobs)
+Job 1──* RunResult            (one per executor attempt / loop iteration)
+RunResult 0..1──1 PatchProposal   (on failure + AI; escalate has empty diffs)
+CLI run 1──1 JournalEntry     (once at end; no log body)
+PatchProposal *──▸ working tree files (applied/rolled back; not stored as blobs)
 ```
 
 ---
@@ -418,7 +399,7 @@ Machine-oriented detail stays in `.pipedebug/history.md` (one row), not a JSON A
 JSON body to chat completions including:
 
 - System: scope rules (minor vs escalate; no architecture changes; return patch or escalate)
-- User: `FailureArtifact` fields — job/step name, exit code, capped log tail, relevant file/YAML snippets, allowlisted paths
+- User: failed step, exit code, capped log tail, relevant file/YAML snippets
 
 **Expected LLM response (parsed into `PatchProposal`)**
 
@@ -432,11 +413,11 @@ JSON body to chat completions including:
 }
 ```
 
-If `decision` is `escalate`, `files` is empty and the loop stops. Invalid JSON / paths outside allowlist → treat as failure of that iteration (no apply, or rollback).
+If `decision` is `escalate`, `files` is empty and the loop stops. Invalid JSON / paths outside allowlist → skip apply / rollback.
 
-#### Internal Go interfaces (package API)
+#### Internal Go interfaces (test seams only)
 
-Stable seams for unit tests; not network endpoints:
+Mock the two external I/O edges; keep patcher/journal concrete:
 
 ```go
 type Executor interface {
@@ -444,16 +425,7 @@ type Executor interface {
 }
 
 type LLMClient interface {
-    ProposeFix(ctx context.Context, failure FailureArtifact) (PatchProposal, error)
-}
-
-type Patcher interface {
-    Apply(ctx context.Context, proposal PatchProposal) (applied []string, err error)
-    Rollback(ctx context.Context) error
-}
-
-type Journal interface {
-    Append(entry JournalEntry) error
+    ProposeFix(ctx context.Context, result RunResult, snippets map[string]string) (PatchProposal, error)
 }
 ```
 
@@ -473,27 +445,186 @@ If AI is enabled and the LLM key is missing → exit `3` with a clear message. `
 
 ## 6. Component Design
 
-*TBD*
+Keep the surface small: **interfaces only where we mock I/O** (`Executor`, `LLMClient`). Concrete Docker runner and CLI config are first-class—without an enterprise “arg parser framework” package.
 
-### Class diagrams (UML)
+### CLI parameters → typed config
+
+**Yes — parse once into a struct. No — don’t build a separate `ArgParser` package.**
+
+| Approach | Verdict |
+|----------|---------|
+| Scatter `flag.String` / `os.Args` reads across packages | Bad — hard to test, flags leak into core |
+| Dedicated `internal/argparser` with plugins/registry | Overengineered for this CLI |
+| `cmd/pipedebug`: parse argv → `Config`, validate, pass down | **Preferred** |
+
+**Library choice:** stdlib `flag` is enough for a single `run` command. Use **Cobra** when we add `doctor` (subcommand UX is its job). Either way, the output is the same: a `Config` value.
+
+```go
+// Built in cmd/pipedebug from flags + env; passed into loop — never re-parsed deeper.
+type Config struct {
+    RepoDir        string
+    Workflow       string
+    Job            string
+    Image          string // optional override
+    EnvFile        string
+    AI             bool
+    MaxIterations  int
+    Verbose        bool
+}
+```
+
+Flow: `main` → `ParseConfig(os.Args)` → validate (job required if ambiguous, AI implies API key present, etc.) → construct `DockerRunner` / `LLM` / `Patcher` / `Journal` → `loop.Run(ctx, job, cfg)`.
 
 ### Module diagrams
 
+#### Repository layout
+
+```
+pipedebug/
+├── cmd/pipedebug/
+│   ├── main.go          # wire deps, map errors → exit codes
+│   └── config.go        # ParseConfig / validation (CLI boundary)
+├── internal/
+│   ├── parser/          # YAML → Job (+ runs-on → image helpers)
+│   ├── executor/        # Executor interface + DockerRunner
+│   ├── llm/             # LLMClient interface + HTTP impl
+│   ├── patcher/         # apply / rollback diffs
+│   ├── journal/         # append history.md
+│   └── loop/            # orchestration
+└── go.mod
+```
+
+Shared types (`Job`, `Step`, `RunResult`, `PatchProposal`) live next to owners or a tiny `internal/types` only if import cycles force it—no `domain` / `failure` / `scopegate` layers.
+
+#### Module dependency diagram
+
+```mermaid
+flowchart TB
+  cmd[cmd/pipedebug<br/>ParseConfig → Config]
+  parser[internal/parser]
+  exec[internal/executor<br/>DockerRunner]
+  llm[internal/llm]
+  patch[internal/patcher]
+  journal[internal/journal]
+  loop[internal/loop]
+
+  cmd --> parser
+  cmd --> loop
+  cmd --> exec
+  cmd --> llm
+  loop --> exec
+  loop --> llm
+  loop --> patch
+  loop --> journal
+```
+
+### Class diagrams (UML)
+
+```mermaid
+classDiagram
+  direction TB
+
+  class Config {
+    +RepoDir string
+    +Workflow string
+    +Job string
+    +Image string
+    +EnvFile string
+    +AI bool
+    +MaxIterations int
+    +Verbose bool
+  }
+
+  class Job {
+    +Name string
+    +Image string
+    +Steps []Step
+  }
+
+  class Step {
+    +Name string
+    +Run string
+  }
+
+  class RunResult {
+    +Passed bool
+    +FailedStep string
+    +ExitCode int
+    +Tail string
+  }
+
+  class PatchProposal {
+    +Decision fix|escalate
+    +Rationale string
+    +Diffs map~path,unifiedDiff~
+  }
+
+  class Executor {
+    <<interface>>
+    +Run(ctx, Job) RunResult
+  }
+
+  class DockerRunner {
+    -docker DockerAPI
+    -repoDir string
+    -envFile string
+    -verbose bool
+    +Run(ctx, Job) RunResult
+  }
+
+  class LLMClient {
+    <<interface>>
+    +ProposeFix(ctx, RunResult, snippets) PatchProposal
+  }
+
+  class Patcher {
+    +Apply(PatchProposal) error
+    +Rollback() error
+  }
+
+  class Journal {
+    +Append(...) error
+  }
+
+  class Loop {
+    -exec Executor
+    -llm LLMClient
+    -patcher Patcher
+    -journal Journal
+    +Run(ctx, Job, Config) error
+  }
+
+  Job "1" *-- "*" Step
+  DockerRunner ..|> Executor
+  Loop --> Executor
+  Loop --> LLMClient
+  Loop --> Patcher
+  Loop --> Journal
+  Loop --> Config : reads options
+  DockerRunner --> RunResult : produces
+  LLMClient --> PatchProposal : produces
+  Patcher --> PatchProposal : applies
+```
+
+`DockerRunner` (not a vague “handler”) owns all Docker Engine interaction: create/start container, bind-mount `Config.RepoDir`, inject env from `Config.EnvFile`, stream step output into a private capped tail, return `RunResult`. Tests inject a fake `Executor` instead.
+
+**Still omitted (details, not architecture):** private log-tail buffer inside `DockerRunner`; separate `FailureArtifact` type; interface wrappers for `Patcher` / `Journal`.
+
+#### Key behaviors
+
+| Component | Behavior |
+|-----------|----------|
+| `cmd` / `Config` | Parse + validate CLI/env once; wire concrete deps; set exit codes |
+| `parser` | Workflow YAML → `Job`; apply `--image` override from `Config` when set |
+| `DockerRunner` | Execute `Job` in Docker with parity mounts/env; capped tail; log UX |
+| `llm` | Tail + snippets → `fix` + diffs or `escalate` |
+| `patcher` | Allowlisted apply / rollback |
+| `loop` | Iterations + stop conditions; journal once at end |
+| `journal` | Append one Markdown table row |
+
 ---
 
-## 7. Unit Tests
-
-*TBD*
-
-### Normal case
-
-### Boundary / corner cases
-
-### Exception cases
-
----
-
-## 8. Non-Functional Requirements
+## 7. Non-Functional Requirements
 
 *TBD*
 
@@ -507,7 +638,7 @@ If AI is enabled and the LLM key is missing → exit `3` with a clear message. `
 
 ---
 
-## 9. Deployment Architecture
+## 8. Deployment Architecture
 
 *TBD*
 
@@ -519,7 +650,7 @@ If AI is enabled and the LLM key is missing → exit `3` with a clear message. `
 
 ---
 
-## 10. Risks & Tradeoffs
+## 9. Risks & Tradeoffs
 
 *TBD*
 
