@@ -626,34 +626,147 @@ classDiagram
 
 ## 7. Non-Functional Requirements
 
-*TBD*
+NFRs for a **local CLI** (not a multi-tenant service). Targets are practical demo/dev-machine expectations.
 
 ### Performance
 
+| Area | Requirement |
+|------|-------------|
+| Orchestrator overhead | Go process should add negligible latency vs the Docker job itself (parse + wire-up typically under 1s for normal workflows) |
+| Log handling | Capped tail buffer (~100–200 lines / ~256KB) so long CI output cannot grow host memory unbounded |
+| Terminal UX | Step progress lines appear as steps start/finish; failure tail prints promptly after the failing step exits |
+| LLM calls | Bounded by `--max-iterations` (default 3); each call sends only tail + small snippets, not the full repo |
+| Re-runs | After a patch, re-run the same job without redundant image pulls when the image is already local |
+| Journal | Append one row; must stay O(1) work per run (no rewriting full history) |
+
+Non-goals: beating hosted CI wall-clock for heavy builds; caching build artifacts beyond what Docker/layer caching already provides.
+
 ### Scalability
+
+This product scales with **developer machines and repo size**, not request QPS.
+
+| Dimension | Approach |
+|-----------|----------|
+| Concurrent users | One CLI process per invocation; no shared server |
+| Job size | Supported as far as local Docker + disk allow; we only retain a log tail |
+| AI iterations | Hard cap (`--max-iterations`) to bound time and API cost |
+| History file | Append-only Markdown; acceptable to grow slowly—document that users may truncate/delete `.pipedebug/history.md` |
+| Multi-job workflows | MVP runs one selected job; parallel matrix fan-out is out of scope |
 
 ### Security
 
+| Area | Requirement |
+|------|-------------|
+| Secrets | From `--env-file` / flags only; inject into the container; **never** write to journal, README, or LLM prompts |
+| LLM data | Send capped log tail + relevant snippets only; do not upload the whole workspace by default |
+| Patches | Apply only under repo-relative allowlist; reject `..`, absolute paths, and escapes outside `Config.RepoDir` |
+| Git | Never auto-commit or push; user reviews `git diff` |
+| API keys | LLM key via env only; not logged; not echoed in verbose output |
+| Docker trust | Runs with the privileges of the local Docker daemon/user—document that malicious CI YAML can execute as whatever the mounted workspace + container user allows (same class of risk as running CI locally) |
+| Supply chain | Pin Go module versions; prefer Docker Engine API over shelling unsanitized strings where practical |
+
 ### Reliability
+
+| Area | Requirement |
+|------|-------------|
+| Docker down / pull fail | Fail fast with exit code `3` and an actionable message (no partial silent success) |
+| LLM errors / timeouts | Stop the auto-debug loop; leave workspace as last good apply (or rolled back if apply failed); surface the CI failure |
+| Bad patch | Rollback last apply; count toward iteration limit; do not leave a half-applied diff |
+| Crash mid-run | Best-effort container cleanup (`defer` remove); temp/orphan containers should not accumulate across normal failures |
+| Unsupported YAML | Error clearly at parse time rather than inventing incorrect behavior |
+| Idempotent journal | A completed run appends exactly one row (success, fail, escalate, or max iterations) |
+| `--no-ai` | Pure local execution path with no network dependency on the LLM |
 
 ---
 
 ## 8. Deployment Architecture
 
-*TBD*
+**No hosted deployment.** PipeDebug is a local CLI: it runs on the developer’s machine (or any agent with Docker), not as a cloud service. There is no app server, load balancer, or multi-tenant environment to provision.
+
+What “deploy” means here: **build and distribute a Go binary**, plus document host prerequisites.
 
 ### Environments
 
+| Environment | Role |
+|-------------|------|
+| Developer laptop | Primary: `pipedebug run` against a local repo + Docker Desktop/Engine |
+| Optional CI agent | Same binary can run in automation if Docker-in-Docker / sibling Docker is available—not required for MVP |
+| Staging / prod SaaS | **N/A** |
+
+**Host prerequisites**
+- Docker Engine (daemon running)
+- Network access to pull runner images (first run) and to the LLM API when AI is enabled
+- LLM API key in env when not using `--no-ai`
+
 ### CI/CD
 
+CI/CD for **this repo** (building PipeDebug itself), not for deploying a backend:
+
+| Piece | Approach |
+|-------|----------|
+| Build | `go build -o pipedebug ./cmd/pipedebug` |
+| Test | `go test ./...` on PRs |
+| Release (optional) | GitHub Releases with binaries via GoReleaser or `go install` from the module path |
+| Install for users | `go install …/cmd/pipedebug@latest` or download release artifact |
+
+PipeDebug does not deploy customer apps; it only helps debug *their* pipelines locally.
+
 ### Cloud resources
+
+| Resource | Needed? |
+|----------|---------|
+| VMs / Kubernetes / serverless | No |
+| Managed DB / object storage | No |
+| Hosted PipeDebug API | No |
+| Third-party (user-provided) | Docker Hub (or other registries) for images; LLM provider API |
 
 ---
 
 ## 9. Risks & Tradeoffs
 
-*TBD*
-
 ### Alternative approaches considered
 
+| Topic | Alternatives | Choice | Why |
+|-------|--------------|--------|-----|
+| Language | TypeScript, Python | **Go** | Single static binary, solid Docker/HTTP ecosystem, strong CLI signal |
+| UI | Web dashboard, TUI | **CLI only** | Core loop is terminal feedback; a SPA dilutes scope without helping demos much |
+| Persistence | SQLite / full log archive | **Markdown journal + in-memory log tail** | Tiny footprint; enough history without a DB |
+| Log capture | Full temp spool + ring buffer | **Capped in-memory tail only** | Dual spool was overkill for MVP; failures show up in the tail |
+| Patch isolation | Git worktree / scratch branch | **Edit working tree + no auto-commit** | Simpler mental model; user owns `git diff` / commit |
+| Docker access | Shell out to `docker` only | **Engine API preferred** (CLI wrapper acceptable) | Cleaner control of mounts/logs; still mockable behind `Executor` |
+| LLM scope gate | Separate classifier service/package | **`fix` \| `escalate` in one LLM response** + allowlist in `patcher` | Fewer moving parts |
+| CLI parsing | Custom `ArgParser` package / scattered `os.Args` | **`Config` parsed once in `cmd`** (`flag` → Cobra when subcommands land) | Standard Go CLI shape |
+| Hosted product | SaaS runner / remote agents | **Local-only** | Matches the problem (parity on your machine); no cloud deploy surface |
+
+### Risks & mitigations
+
+| Risk | Impact | Mitigation |
+|------|--------|------------|
+| Incomplete parity with GitHub-hosted runners | Local green ≠ remote green (or the reverse) | MVP focuses on `run:` steps; document gaps (marketplace actions, OIDC, services); optional image override |
+| LLM changes architecture or over-edits | Bad diffs, lost trust | Prompt rules + `escalate` path + path allowlist + `--max-iterations` + no auto-commit |
+| Secrets leak to LLM or journal | Security incident | Never put env-file values in prompts or history rows; only log tails + code snippets |
+| Malicious/unsafe CI YAML locally | Arbitrary code as Docker user | Same class of risk as “run CI locally”; document clearly; don’t escalate privileges |
+| Huge step logs | Memory pressure / useless LLM context | Capped tail buffer; send only that tail + small snippets |
+| Unsupported YAML silently mis-run | False confidence | Fail loudly at parse time for unsupported features |
+| Docker daemon missing / pull failures | Tool unusable | Exit `3` with actionable errors; P1 `doctor` |
+| LLM outage / bad JSON | Loop stuck or broken tree | Timeout; stop loop; rollback failed applies; `--no-ai` escape hatch |
+| Patch apply leaves dirty tree | User frustration | Atomic-enough apply + rollback on failure / non-improvement |
+
 ### Known limitations
+
+- **Not a replacement for hosted CI** — merges/deploys still go through GitHub Actions / GitLab / CircleCI
+- **GitHub Actions MVP** — marketplace actions, complex `services:`, matrix strategy, and reusable workflows are limited or unsupported initially
+- **Parity is approximate** — runner images and preinstalled tools won’t match GitHub’s VM identically
+- **One job per invocation** — no full workflow graph / parallel jobs in MVP
+- **AI fixes are best-effort** — minor errors only; architectural and ambiguous failures escalate
+- **No dashboard / remote run compare** in this build
+- **No full log retention** — only capped tails unless a later opt-in is added
+- **Requires Docker + (for AI) an LLM API key and network**
+- **Patches modify the working tree** — concurrent edits by the user during a run can conflict (don’t run against a tree you’re actively rewriting)
+
+### Open decisions (non-blocking for MVP)
+
+1. Docker Engine SDK vs `docker` CLI wrapper for v1 implementation speed
+2. How much of the Actions marketplace to stub vs. require equivalent `run:` scripts
+3. Whether step-through (P1) reuses one long-lived container or recreates per step
+4. Cloud LLM only vs. optional local model (Ollama) later
