@@ -7,7 +7,7 @@
 
 ## 1. Overview
 
-PipeDebug is a CLI-first developer tool that runs CI/CD jobs locally inside Docker containers that mirror remote runner environments (GitHub Actions, GitLab CI, CircleCI). When a local run fails, an LLM analyzes the failure output, proposes and applies fixes for **minor** code and CI config errors, then re-runs the container until the job passes—or until the failure is judged out of scope for automated repair.
+PipeDebug is a CLI-first developer tool that runs **GitHub Actions** jobs locally via [nektos/act](https://github.com/nektos/act) (Docker-backed), then—when a local run fails—uses an LLM to propose and apply fixes for **minor** code and CI config errors and re-runs until the job passes or the failure is judged out of scope for automated repair.
 
 ---
 
@@ -35,7 +35,7 @@ Developers want to prototype and debug CI jobs on their machine with environment
 
 | Goal | Description |
 |------|-------------|
-| G1 | Run pipeline steps locally in a container that closely matches the remote CI runner |
+| G1 | Run GitHub Actions jobs locally (via act + Docker) with parity close to the remote runner |
 | G2 | Surface failures with clear step context and logs (same failure mode as remote when parity holds) |
 | G3 | Optionally step through jobs: pause, inspect/modify, continue |
 | G4 | On failure, use an LLM to fix **minor** errors and automatically re-run until success or escalation |
@@ -43,8 +43,10 @@ Developers want to prototype and debug CI jobs on their machine with environment
 
 ### Non-goals
 
-- Replacing hosted CI (GitHub Actions / GitLab / CircleCI) as the source of truth for merges and deployments
-- Guaranteeing 100% parity with every proprietary runner feature (secrets vaults, OIDC, hosted services)
+- Replacing hosted GitHub Actions as the source of truth for merges and deployments
+- Reimplementing a GitHub Actions runner (parity comes from act)
+- Shipping GitLab CI / CircleCI support in this project (architecture may stay expandable; not a product commitment)
+- Guaranteeing 100% parity with every GitHub-hosted runner feature (secrets vaults, OIDC, hosted services)—bounded by what act can emulate
 - Letting the LLM redesign architecture, choose frameworks, or make product trade-offs
 
 ---
@@ -52,8 +54,8 @@ Developers want to prototype and debug CI jobs on their machine with environment
 ## 4. Users
 
 - Solo developers and small teams (roughly 2–10 people)
-- Backend / DevOps-leaning engineers who edit CI YAML often
-- Users of GitHub Actions, GitLab CI, or CircleCI who want a faster local feedback loop
+- Backend / DevOps-leaning engineers who edit GitHub Actions YAML often
+- Developers who want a faster local feedback loop before pushing to GitHub Actions
 
 ---
 
@@ -71,9 +73,9 @@ Developers want to prototype and debug CI jobs on their machine with environment
 
 | Concept | Meaning |
 |---------|---------|
-| **Pipeline config** | Repo CI file(s), e.g. `.github/workflows/*.yml`, `.gitlab-ci.yml`, CircleCI config |
-| **Runner image** | Docker image chosen to approximate the remote job’s OS / toolchain |
-| **Local run** | One execution of selected jobs/steps inside that container |
+| **Pipeline config** | GitHub Actions workflow(s) under `.github/workflows/*.yml` |
+| **Runner image** | Docker image act uses to approximate the remote job’s OS / toolchain |
+| **Local run** | One execution of a selected workflow job via act (+ Docker) |
 | **Failure artifact** | Exit code, step name, stdout/stderr, relevant env, and config snippets |
 | **Auto-debug loop** | Fail → LLM propose patch → apply → re-run → repeat until pass or stop |
 
@@ -85,25 +87,25 @@ Developers want to prototype and debug CI jobs on their machine with environment
 
 | ID | Requirement | Priority |
 |----|-------------|----------|
-| FR-CLI-1 | `pipedebug run` detects CI config in the current repo and runs the selected workflow/job locally in Docker | P0 |
+| FR-CLI-1 | `pipedebug run` detects GitHub Actions workflows in the current repo and runs the selected workflow/job locally via act (+ Docker) | P0 |
 | FR-CLI-2 | Support selecting workflow, job, and optionally step range (e.g. one job, or from step N) | P0 |
 | FR-CLI-3 | Stream step logs to the terminal with clear step boundaries and final pass/fail status | P0 |
 | FR-CLI-4 | Exit non-zero when the local run fails (usable in scripts) | P0 |
 | FR-CLI-5 | `pipedebug run --step-through` pauses between steps; user can inspect, edit a command, or continue | P1 |
-| FR-CLI-6 | `pipedebug doctor` checks Docker availability, image pull ability, and basic config parse health | P1 |
+| FR-CLI-6 | `pipedebug doctor` checks Docker availability, act availability, image pull ability, and basic workflow parse health | P1 |
 | FR-CLI-7 | Configurable runner image override when auto-detection is wrong | P1 |
 
 ### 7.2 Local environment parity
 
 | ID | Requirement | Priority |
 |----|-------------|----------|
-| FR-PAR-1 | Parse GitHub Actions workflows sufficiently to run jobs/steps in order with working directory and env | P0 |
-| FR-PAR-2 | Parse GitLab CI jobs (script, image, variables, `before_script` / `after_script` where applicable) | P1 |
-| FR-PAR-3 | Parse CircleCI jobs (orbs deferred; basic job/step execution first) | P2 |
-| FR-PAR-4 | Mount the repo into the container; run steps against that working tree | P0 |
-| FR-PAR-5 | Map common runner images (e.g. `ubuntu-latest`-class) to concrete Docker images | P0 |
+| FR-PAR-1 | Detect/select GitHub Actions workflows and jobs; run them locally via nektos/act (including `run:`, `uses:`, `if`, etc. as supported by act) | P0 |
+| FR-PAR-2 | ~~GitLab CI~~ | **Dropped** — out of project scope; keep `Executor` seam only |
+| FR-PAR-3 | ~~CircleCI~~ | **Dropped** — out of project scope |
+| FR-PAR-4 | Execute against the mounted working tree (act/Docker workspace mount) | P0 |
+| FR-PAR-5 | Support runner image/platform override passed through to act when auto-detection is wrong | P1 |
 | FR-PAR-6 | Inject user-provided secrets/env via local env file or flags (never commit secrets) | P0 |
-| FR-PAR-7 | Document known parity gaps (actions marketplace, self-hosted runners, complex services) | P1 |
+| FR-PAR-7 | Document known parity gaps relative to GitHub-hosted runners / act limitations | P1 |
 
 ### 7.3 LLM auto-debug loop
 
@@ -197,8 +199,8 @@ Dashboard is not required for MVP; CLI + auto-debug loop is the core product.
                                         │
                                         ▼
 ┌─────────────┐   mount repo   ┌──────────────────┐
-│ Docker      │ ◄─────────────│ Runner executor  │
-│ (parity)    │   run steps    └────────┬─────────┘
+│ Docker      │ ◄─────────────│ ActExecutor      │
+│ (via act)   │   run job      └────────┬─────────┘
 └─────────────┘                         │
                                    fail │ pass → done
                                         ▼
@@ -220,9 +222,9 @@ Dashboard is not required for MVP; CLI + auto-debug loop is the core product.
 
 | Component | Responsibility |
 |-----------|----------------|
-| Config parsers | Provider-specific YAML → normalized job/step IR |
-| Image resolver | Map `runs-on` / `image` → Docker image |
-| Executor | Create container, mount workspace, run steps, collect logs |
+| Workflow select / validate | Detect `.github/workflows`; select workflow/job; optional actionlint; build invocation `Job` |
+| ActExecutor | Run selected job via nektos/act; stream/capture logs into capped tail → `RunResult` |
+| Executor (interface) | Abstraction over job execution so a future non-GHA backend could plug in without rewriting the AI loop |
 | Failure packager | Build structured context for the LLM (bounded size) |
 | Scope classifier | Minor vs out-of-scope (rules + LLM judgment) |
 | Patch applier | Apply unified diffs; validate; rollback on bad apply |
@@ -232,7 +234,7 @@ Dashboard is not required for MVP; CLI + auto-debug loop is the core product.
 ### Constraints
 
 - Prefer a single language/runtime for the CLI unless there’s a clear reason to split
-- Keep parsers honest about unsupported YAML features rather than silently inventing behavior
+- Prefer act for Actions execution; document act/GHA parity gaps rather than silently inventing behavior
 - Cap LLM context (tail of logs + relevant file snippets) to keep runs predictable
 - All LLM calls require an API key supplied by the developer via env/config
 
@@ -254,24 +256,24 @@ Dashboard is not required for MVP; CLI + auto-debug loop is the core product.
 
 ### Must ship (P0)
 
-- `pipedebug run` for GitHub Actions (one workflow / job)
-- Docker-based execution with repo mount and streamed logs
+- `pipedebug run` for GitHub Actions (one workflow / job) via **nektos/act**
+- Streamed logs + capped failure tail for humans and the LLM
 - Failure packaging + LLM minor-fix loop with max iterations and `--no-ai`
 - No auto-commit; clear terminal report of patches applied
 
 ### Should ship (P1)
 
-- Step-through mode
-- `pipedebug doctor`
-- Image override + secrets/env injection
+- `pipedebug doctor` (Docker + act + workflow health)
+- Image/platform override + secrets/env injection (via act)
 - Patch rollback per failed iteration
-- GitLab CI basic support
+- Step-through mode only if cleanly feasible on top of act
 
 ### Nice to have (P2)
 
-- CircleCI basic support
 - Web dashboard + local-vs-remote diff
-- Richer marketplace action emulation
+- Deeper act output parsing (richer failed-step attribution)
+
+**Explicitly not in scope:** GitLab CI, CircleCI.
 
 ---
 
@@ -279,19 +281,19 @@ Dashboard is not required for MVP; CLI + auto-debug loop is the core product.
 
 | Risk | Mitigation |
 |------|------------|
-| Incomplete parity with hosted runners | Document gaps; start with shell/`run` steps before complex actions |
+| Incomplete parity with hosted runners | Depend on act; document act/GHA gaps honestly |
 | LLM over-edits architecture | Hard scope rules + escalate path + path allowlist + iteration cap |
 | Unsafe patches | Diff preview, rollback, never auto-commit, refuse edits outside allowlist |
 | Huge logs blow context | Truncate/summarize; keep failing step + nearby config |
-| Provider YAML complexity | Normalized IR; unsupported features fail loudly |
+| act integration complexity | Thin `ActExecutor` adapter; pin act version; fake `Executor` in loop tests |
 
 ---
 
 ## 13. Open Questions
 
-1. Which language/stack for the CLI (Go vs TypeScript vs Python)?
-2. How much of the GitHub Actions marketplace should MVP pretend to support vs. “run:” scripts only?
-3. Should step-through reuse one long-lived container, or recreate between steps?
+1. ~~Which language/stack for the CLI?~~ → **Go** (locked in TDD)
+2. act as Go library vs shell-out to `act` CLI for v1?
+3. Is step-through feasible on top of act, or defer?
 4. Local-only LLM option (e.g. Ollama) vs cloud API only for v1?
 5. Should applied patches live in a git worktree / branch by default for safer review?
 

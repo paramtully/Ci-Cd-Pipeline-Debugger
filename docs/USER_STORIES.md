@@ -15,34 +15,34 @@ Stories are written for the developer end user. Priority aligns with the [PRD](P
 
 ## Epic A — Local CI execution
 
-### US-A1 — Run a CI job locally
+### US-A1 — Run a GitHub Actions job locally
 **Priority:** P0  
-**Related:** FR-CLI-1, FR-CLI-3, FR-CLI-4, FR-PAR-1, FR-PAR-4, FR-PAR-5
+**Related:** FR-CLI-1, FR-CLI-3, FR-CLI-4, FR-PAR-1, FR-PAR-4
 
 > As a developer,  
-> I want to run a CI job from my repo locally with `pipedebug run`,  
+> I want to run a GitHub Actions job from my repo locally with `pipedebug run`,  
 > so that I can see pass/fail without committing and waiting for a remote runner.
 
 **Acceptance criteria**
-- [ ] From a repo with a supported CI config, `pipedebug run` starts a Docker container and executes the selected job’s steps
-- [ ] Step logs stream to the terminal with clear step boundaries
+- [ ] From a repo with `.github/workflows`, `pipedebug run` executes the selected job via **nektos/act** (+ Docker)
+- [ ] Job logs stream to the terminal with clear progress / failure output
 - [ ] The process exits `0` on success and non-zero on failure
-- [ ] The working tree in the container is the local repo (mounted), not a remote checkout
+- [ ] The working tree used by the job is the local repo (mounted), not a remote checkout
 
 ---
 
-### US-A2 — Select workflow, job, and steps
+### US-A2 — Select workflow and job
 **Priority:** P0  
 **Related:** FR-CLI-2
 
 > As a developer,  
-> I want to choose which workflow, job, and step range to run,  
+> I want to choose which workflow and job to run,  
 > so that I can focus on the failing part of the pipeline instead of the whole workflow.
 
 **Acceptance criteria**
 - [ ] User can specify workflow and/or job via CLI flags
-- [ ] User can optionally start from (or limit to) a step range
 - [ ] If multiple workflows/jobs exist and none is selected, the tool prompts or errors with a clear message
+- [ ] Step-range selection is optional/P1 and only if cleanly supported on top of act
 
 ---
 
@@ -63,15 +63,15 @@ Stories are written for the developer end user. Priority aligns with the [PRD](P
 
 ### US-A4 — Override the runner image
 **Priority:** P1  
-**Related:** FR-CLI-7
+**Related:** FR-CLI-7, FR-PAR-5
 
 > As a DevOps engineer,  
-> I want to override the Docker image used for a local run,  
+> I want to override the Docker image / platform used for a local act run,  
 > so that I can match a custom or mis-detected runner environment.
 
 **Acceptance criteria**
-- [ ] CLI accepts an image override
-- [ ] When set, steps run in that image instead of the auto-resolved default
+- [ ] CLI accepts an image/platform override
+- [ ] When set, the override is passed through to act
 - [ ] Override is reported in the run output so the user knows which image was used
 
 ---
@@ -82,12 +82,13 @@ Stories are written for the developer end user. Priority aligns with the [PRD](P
 
 > As a developer,  
 > I want a `pipedebug doctor` command,  
-> so that I can quickly verify Docker, image access, and CI config parsing before debugging a failure.
+> so that I can quickly verify Docker, act, image access, and workflow selection before debugging a failure.
 
 **Acceptance criteria**
 - [ ] Checks Docker availability
-- [ ] Checks ability to pull/use a runner image
-- [ ] Parses the detected CI config and reports basic health / parse errors
+- [ ] Checks act availability / basic invocation health
+- [ ] Checks ability to pull/use a runner image (when practical)
+- [ ] Detects workflows and reports basic health / selection errors
 - [ ] Prints clear pass/fail results for each check
 
 ---
@@ -108,32 +109,16 @@ Stories are written for the developer end user. Priority aligns with the [PRD](P
 ---
 
 ### US-A7 — Run GitLab CI jobs locally
-**Priority:** P1  
+**Priority:** Dropped (out of scope)  
 **Related:** FR-PAR-2
 
-> As a developer using GitLab CI,  
-> I want PipeDebug to parse and run my `.gitlab-ci.yml` jobs locally,  
-> so that I get the same local feedback loop as GitHub Actions users.
-
-**Acceptance criteria**
-- [ ] Detects `.gitlab-ci.yml`
-- [ ] Supports job `script`, image, variables, and `before_script` / `after_script` where applicable
-- [ ] Unsupported features fail with a clear message rather than silent incorrect behavior
-
----
+> Dropped for this project. Keep the `Executor` interface so a future GitLab backend could plug in without rewriting the AI loop—do not implement or advertise GitLab support now.
 
 ### US-A8 — Run CircleCI jobs locally
-**Priority:** P2  
+**Priority:** Dropped (out of scope)  
 **Related:** FR-PAR-3
 
-> As a developer using CircleCI,  
-> I want PipeDebug to run basic CircleCI jobs locally,  
-> so that I can debug pipeline steps without pushing.
-
-**Acceptance criteria**
-- [ ] Detects CircleCI config
-- [ ] Runs basic job/step execution (orbs out of scope for initial support)
-- [ ] Unsupported features fail loudly with guidance
+> Dropped for this project.
 
 ---
 
@@ -279,5 +264,6 @@ Stories are written for the developer end user. Priority aligns with the [PRD](P
 | Priority | Stories |
 |----------|---------|
 | P0 | US-A1, US-A2, US-A3, US-B1, US-B2, US-B3, US-B4 |
-| P1 | US-A4, US-A5, US-A6, US-A7, US-B5, US-B6, US-B7 |
-| P2 | US-A8, US-C1, US-C2 |
+| P1 | US-A4, US-A5, US-A6, US-B5, US-B6, US-B7 |
+| P2 | US-C1, US-C2 |
+| Dropped | US-A7 (GitLab), US-A8 (CircleCI) |

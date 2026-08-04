@@ -9,7 +9,7 @@
 
 ### Purpose
 
-PipeDebug (`pipedebug`) is a CLI-first tool that executes CI/CD jobs locally inside Docker containers that mirror remote runner environments (GitHub Actions first; GitLab CI and CircleCI later). On failure, an optional LLM auto-debug loop packages the failure context, proposes scoped patches for minor code/CI errors, applies them within an allowlist, and re-runs the job until it passes or the failure is escalated to the user.
+PipeDebug (`pipedebug`) is a CLI-first tool that runs **GitHub Actions** jobs locally (via [nektos/act](https://github.com/nektos/act) + Docker) and, on failure, runs an optional LLM auto-debug loop: package failure context → scoped patch for minor code/CI errors → apply within an allowlist → re-run until pass or escalate.
 
 This document describes how the system will be built: components, data, APIs, tests, and operational constraints. Product intent and user-facing requirements live in the PRD; this TDD is the engineering contract for implementation.
 
@@ -17,35 +17,40 @@ This document describes how the system will be built: components, data, APIs, te
 
 **In scope (MVP / P0)**
 - CLI entrypoint (`pipedebug run`, flags for job selection, `--no-ai`, `--max-iterations`)
-- GitHub Actions workflow parsing sufficient to run jobs/`run` steps locally
-- Docker-based executor with repo mount, env/secrets injection, streamed logs
+- GitHub Actions only: detect `.github/workflows`, select workflow/job
+- **`ActExecutor`**: run the selected job through **nektos/act** (parity for `run:`, `uses:`, `if`, etc. comes from act—not a custom step runner)
+- Stream/capture logs into a capped tail for humans + LLM; env/secrets via act/`--env-file`
 - Failure packaging → LLM scoped patch → apply → re-run loop
 - Scope gate so architectural / ambiguous failures escalate instead of auto-editing
 - No automatic git commits
 
 **In scope (later / P1–P2)**
-- Step-through mode, `pipedebug doctor`, image override
+- Step-through mode (if act integration allows cleanly; otherwise defer), `pipedebug doctor`
+- Image/platform override flags passed through to act
 - Patch preview/rollback
-- GitLab CI / CircleCI parsers
 
 **Out of scope (for this project)**
+- GitLab CI / CircleCI support (not committed; architecture stays expandable—see below)
 - Replacing hosted CI as the merge/deploy source of truth
-- Full emulation of every marketplace action, OIDC, or proprietary runner feature
+- Reimplementing a GitHub Actions runner (act owns execution parity)
 - LLM-driven architecture or product redesigns
 - Interactive web dashboard / hosted multi-tenant UI (see §2 — demo via CLI + README instead)
 - Persisting full step logs (stream is capped to a tail buffer; no log archive in MVP)
+
+**Expandability (deliberate non-goal to implement now)**  
+Keep `Executor` + a small `Job` IR so a future GitLab (or other) backend could plug in without rewriting the AI loop. Do **not** build GitLab parsers/executors or advertise multi-provider support until shipped. Resume narrative: focused GHA + AI loop; clean seam if asked “how would you add GitLab?”
 
 ### Key requirements from PRD
 
 | ID | Requirement | Design implication |
 |----|-------------|--------------------|
-| G1 / FR-PAR-* | Local environment parity via Docker | Image resolver + executor are core; parity gaps must fail loudly |
-| G2 / FR-CLI-3–4 | Clear step logs and exit codes | Structured step runner with streamed stdout/stderr |
-| G3 / FR-CLI-5 | Optional step-through | Executor must support pause/resume in one container session |
+| G1 / FR-PAR-* | Local environment parity via Docker + act | `ActExecutor` wraps act; document act’s remaining parity gaps |
+| G2 / FR-CLI-3–4 | Clear step logs and exit codes | Parse/stream act output into step boundaries + capped tail + exit mapping |
+| G3 / FR-CLI-5 | Optional step-through | P1 only if feasible on top of act; otherwise defer |
 | G4 / FR-LLM-* | Auto-debug minor failures and re-run | Loop controller + failure packager + patch applier + LLM client |
 | G5 | Human owns architecture | Classifier/scope gate before any write; escalate path required |
 | FR-LLM-10 | Never auto-commit | Patch applier edits working tree only |
-| FR-CLI-7 / FR-PAR-6 | Image override + secrets | Config layer for env files/flags; never persist secrets into repo |
+| FR-CLI-7 / FR-PAR-6 | Image override + secrets | Pass through to act; never persist secrets into repo |
 | FR-UI-* (P2) | Dashboard (PRD later) | **Deferred:** no web UI in this build; history via append-only run journal + strong CLI/README demo |
 
 ### Design decisions (locked)
@@ -53,6 +58,8 @@ This document describes how the system will be built: components, data, APIs, te
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
 | Language | Go | Strong CLI + Docker ecosystem fit; single static binary is easy to install and demo |
+| CI provider (shipped) | **GitHub Actions only** | Resume focus; one strong demo path. Multi-provider is an extension seam, not a commitment |
+| Job execution | **nektos/act** behind `Executor` | act already handles Actions semantics (`uses`, `if`, contexts, images). Our value is the AI debug loop, not a runner clone |
 | UI | No dashboard | Core product is terminal feedback; a SPA would dilute scope. Hiring managers rarely run full local stacks—README + short demo recording + clean CLI matters more |
 | Persistence | Append-only run journal (Markdown table) | One summary row per run; no full logs by default → tiny disk footprint, human-readable, `git`-friendly to ignore |
 | Log UX | Live progress in terminal; keep only a **capped tail** of each step (drop older lines); on failure show that tail; optional `--verbose` | Avoid flooding terminal/RAM; enough context for humans + LLM without dual spool systems |
@@ -79,13 +86,13 @@ A full dashboard is only useful later if users need to browse many historical ru
 | Layer | Role |
 |-------|------|
 | `cmd/pipedebug` | Parse argv → typed `Config`; subcommands `run` (P1: `doctor`); wire deps; exit codes |
-| CI parser | YAML → `Job` (GitHub Actions first) |
-| `DockerRunner` | Concrete `Executor`: Docker Engine API (preferred) or `docker` CLI; mount repo, run steps, capped log tail |
+| Workflow select / validate | Detect GHA workflows; resolve workflow + job; optional [actionlint](https://github.com/rhysd/actionlint) for clear pre-run errors |
+| `ActExecutor` | Concrete `Executor`: invoke **nektos/act** for the selected job; stream logs; capped tail → `RunResult` |
 | `loop` | fail → LLM propose → patch → re-run |
 | LLM client | HTTP chat/completions → `PatchProposal` |
 | Journal | Append one summary row per completed run |
 
-Pipeline execution always happens **inside Docker**; the Go process is the orchestrator on the host.
+**act** drives containers via Docker; PipeDebug orchestrates act + the AI loop on the host. Prefer calling act as a library (`github.com/nektos/act/...`) when practical; shelling out to the `act` CLI is acceptable for MVP if library integration is sticky—still behind `Executor`.
 
 ### Database
 
@@ -126,7 +133,7 @@ No full log bodies in the journal. Example row:
 | Piece | Choice |
 |-------|--------|
 | Runtime host | Developer laptop/CI agent with Docker available |
-| Job isolation | Docker containers (runner images mapped from `runs-on` / overrides) |
+| Job isolation | Docker containers via nektos/act (Actions runner images / overrides) |
 | Distribution | Go binary via `go install` or GitHub Releases |
 | Hosted cloud app | None required |
 
@@ -142,36 +149,37 @@ No full log bodies in the journal. Example row:
 
 ## 3. Architecture
 
-PipeDebug is a **single Go binary** on the developer machine. It orchestrates Docker (where CI steps actually run) and optionally an LLM API (for scoped auto-fixes). There is no hosted backend or multi-service mesh.
+PipeDebug is a **single Go binary** on the developer machine. It orchestrates **nektos/act** (which uses Docker for the Actions job) and optionally an LLM API (for scoped auto-fixes). There is no hosted backend or multi-service mesh.
 
 ### High-level design
 
 ```
-┌─────────────┐     parse      ┌──────────────────┐
-│ CI YAML     │ ─────────────► │ Job / Step model │
-└─────────────┘                └────────┬─────────┘
-                                        │
-                                        ▼
-┌─────────────┐   mount repo   ┌──────────────────┐
-│ Docker      │ ◄─────────────│ Runner executor  │
-│ (parity)    │   run steps    └────────┬─────────┘
-└─────────────┘                         │
-                         pass ──────────┤──► journal row → done
-                                   fail │
-                                        ▼
-                               ┌──────────────────┐
-                               │ Failure artifact │
-                               └────────┬─────────┘
-                                        ▼
-                               ┌──────────────────┐
-                               │ LLM agent        │
-                               │ (scope gate +    │
-                               │  patch propose)  │
-                               └────────┬─────────┘
-                          escalate ─────┤──► journal row → stop
-                                        │ apply patch
-                                        ▼
-                               re-enter executor (loop)
+┌─────────────┐   select/validate   ┌──────────────────┐
+│ GHA YAML    │ ──────────────────► │ Job (workflow +  │
+│ workflows   │                     │ job id, opts)    │
+└─────────────┘                     └────────┬─────────┘
+                                             │
+                                             ▼
+┌─────────────┐   act runs job      ┌──────────────────┐
+│ Docker      │ ◄──────────────────│ ActExecutor      │
+│ (via act)   │   stream logs       └────────┬─────────┘
+└─────────────┘                              │
+                              pass ──────────┤──► journal row → done
+                                        fail │
+                                             ▼
+                                    ┌──────────────────┐
+                                    │ Failure artifact │
+                                    └────────┬─────────┘
+                                             ▼
+                                    ┌──────────────────┐
+                                    │ LLM agent        │
+                                    │ (scope gate +    │
+                                    │  patch propose)  │
+                                    └────────┬─────────┘
+                               escalate ─────┤──► journal row → stop
+                                             │ apply patch
+                                             ▼
+                                    re-enter executor (loop)
 ```
 
 Same flow as the PRD, with journal write on terminal outcomes (pass, escalate, max iterations).
@@ -183,19 +191,20 @@ What exists outside the binary, and how the user interacts with it:
 ```mermaid
 flowchart LR
   Dev[Developer] -->|CLI commands| PD[pipedebug binary]
-  PD -->|read CI YAML + source| Repo[Local git repo]
+  PD -->|read workflows + source| Repo[Local git repo]
   PD -->|append summary row| Journal[.pipedebug/history.md]
-  PD -->|create/run containers<br/>mount workspace| Docker[Docker Engine]
-  Docker -->|execute steps| Ctr[Runner container]
+  PD -->|run selected job| Act[nektos/act]
+  Act -->|create/run containers| Docker[Docker Engine]
+  Docker -->|execute steps| Ctr[Runner / action containers]
   Ctr -->|read/write via mount| Repo
   PD -->|failure context / patch request| LLM[LLM API]
   LLM -->|scoped patch + rationale| PD
 ```
 
 **Trust / data notes**
-- Secrets and env files stay on the host; injected into the container for the run; never written into the journal
+- Secrets and env files stay on the host; injected for the act run; never written into the journal
 - Failure tails + relevant file snippets are sent to the LLM when AI is enabled; full repo is not uploaded by default
-- The container sees the mounted working tree (same files the developer is editing)
+- Containers see the mounted working tree (same files the developer is editing)
 
 ### Component diagram
 
@@ -206,8 +215,8 @@ flowchart TB
   CLI[cmd/pipedebug<br/>CLI / flags / exit codes]
 
   subgraph core [internal]
-    Parse[parser<br/>CI YAML → Job]
-    Exec[executor<br/>DockerRunner + capped log tail]
+    Parse[parser<br/>GHA detect + job select]
+    Exec[executor<br/>ActExecutor + capped log tail]
     Loop[loop<br/>fail → LLM → patch → re-run]
     Patch[patcher]
     LLMClient[llm]
@@ -220,17 +229,41 @@ flowchart TB
   Loop --> LLMClient
   Loop --> Patch
   Loop --> Journal
+  Exec --> ActExt[nektos/act]
 ```
 
 **Happy-path control flow (AI on)**
 
 1. CLI resolves repo path and flags
-2. `parser` loads workflow → `Job` (including image mapping / `--image`)
-3. `executor` runs steps in Docker; keeps capped log tail; prints progress / failure tail
+2. `parser` finds GitHub Actions workflows, selects workflow + job → `Job` (optional actionlint validation; apply `--image` / platform overrides into act options)
+3. `ActExecutor` runs the job via act; streams output; keeps capped log tail; maps outcome → `RunResult`
 4. On success → `journal` append → exit 0
 5. On failure + AI enabled → `llm` gets tail + snippets → `fix` or `escalate`
 6. If fix → `patcher` applies → back to step 3
 7. If escalate / max iterations → `journal` append → non-zero exit (no auto-commit)
+
+### GitHub Actions + act strategy
+
+**Shipped product = GitHub Actions only.** Do not hand-roll an Actions runner or a multi-provider YAML platform.
+
+```
+detect(.github/workflows) → select workflow + job → types.Job
+ActExecutor.Run(ctx, job) → invoke act → RunResult (capped tail)
+```
+
+| Concern | Owner |
+|---------|--------|
+| Actions semantics (`run`, `uses`, `if`, `id`, expressions, action containers) | **nektos/act** |
+| Workflow/job selection, flags, clear “no workflow” errors | **our parser / CLI** |
+| Optional preflight lint | **actionlint** (library) — nice errors before burning a Docker pull |
+| Capped log tail, `RunResult`, AI loop, patch apply | **PipeDebug** |
+| Image / platform override | Pass through to act (e.g. `-P` / equivalent); do not reimplement `runs-on` maps unless act needs help |
+
+**`Job` IR (execution-oriented)**  
+For act, `Job` is primarily an **invocation handle**: workflow path, job id, repo dir, env/image overrides—not a full re-hosting of every step. Optional light metadata (step names from YAML or act output) helps UX/LLM labeling. We do **not** need to re-encode every Actions field into our structs for the job to run correctly.
+
+**Future providers (not in scope)**  
+`Executor` stays an interface. A later `GitLabExecutor` (or similar) could implement `Run` without changing `loop` / `llm` / `patcher`. Detection can grow a provider enum later. Until then: if the repo has no GHA workflows, fail with a clear message (do not stub GitLab).
 
 ### Service boundaries
 
@@ -238,22 +271,23 @@ Package boundaries (one process—not microservices):
 
 | Boundary | Owns | Must not own |
 |----------|------|--------------|
-| `cmd/pipedebug` | Flags, UX copy, exit codes, wiring | Docker/LLM details |
-| `parser` | YAML → `Job` (+ image mapping) | Running containers, LLM |
-| `executor` | Docker lifecycle, capped tail, log UX | Patching, LLM, journal format |
+| `cmd/pipedebug` | Flags, UX copy, exit codes, wiring | act/Docker/LLM details |
+| `parser` | Detect GHA; select workflow/job; optional actionlint; build `Job` + act options | Running containers; reimplementing Actions execution |
+| `executor` (`ActExecutor`) | Invoke act; stream/capture logs; capped tail → `RunResult` | Patching, LLM, journal format |
 | `llm` | HTTP + parse `PatchProposal` | File I/O |
 | `patcher` | Allowlisted apply/rollback | Re-running CI |
-| `loop` | Iterations + stop reasons | Provider-specific YAML |
+| `loop` | Iterations + stop reasons | act CLI flags / Actions YAML grammar |
 | `journal` | One history row | Full logs |
 
 **External boundaries**
 | External | Interface | Failure mode |
 |----------|-----------|--------------|
-| Docker Engine | Behind `Executor` interface | Clear error if daemon down / pull fails |
+| nektos/act | Behind `Executor` (`ActExecutor`) | Clear error if act missing/fails; map non-zero job → failed `RunResult` |
+| Docker Engine | Used by act | Exit `3` if daemon down / pull fails (surface act/Docker errors) |
 | LLM API | Behind `LLMClient` interface | Stop loop, keep tree, tell user |
 | Repo filesystem | Writes only via `patcher` | Refuse paths outside allowlist |
 
-**IR:** Parsers produce one internal `Job` model. `executor` / `loop` only speak that model—new CI providers = new parser code, not a forked run loop.
+**IR:** `loop` speaks `Job` + `RunResult` only. Swapping act for another backend later = new `Executor` impl, not a forked AI loop.
 
 ---
 
@@ -277,9 +311,8 @@ No temp log files in MVP. Snippets for the LLM are read ad hoc from the workspac
 
 | Entity | Lifetime | Description |
 |--------|----------|-------------|
-| **Job** | Per run | Name, image, ordered steps |
-| **Step** | Per run | Name + command (`run`) |
-| **RunResult** | Per attempt | Pass/fail, failed step, exit code, capped log tail |
+| **Job** | Per run | Workflow path, job name, optional image/platform override (act invocation handle) |
+| **RunResult** | Per attempt | Pass/fail, failed step (from act output when available), exit code, capped log tail |
 | **PatchProposal** | Per AI iteration | `fix` \| `escalate`, rationale, path→diff map |
 | **JournalEntry** | Durable | One summary row when the CLI run finishes |
 
@@ -308,7 +341,6 @@ Header + one Markdown table row appended per completed CLI invocation. No full l
 ### Relationships
 
 ```
-Job 1──* Step
 Job 1──* RunResult            (one per executor attempt / loop iteration)
 RunResult 0..1──1 PatchProposal   (on failure + AI; escalate has empty diffs)
 CLI run 1──1 JournalEntry     (once at end; no log body)
@@ -340,7 +372,7 @@ PipeDebug does **not** expose a hosted REST/HTTP API in MVP. The user-facing int
 | `--no-ai` / `--fix` | AI on | Skip LLM auto-debug |
 | `--max-iterations` | `3` | Cap AI fix attempts |
 | `--verbose` | off | Stream full step output to terminal |
-| `--image` | from `runs-on` map | Override runner image |
+| `--image` | act default platform map | Override runner image / platform passed through to act |
 | `--env-file` | none | Inject secrets/env into container |
 | `--yes` | off | P1 — auto-apply patches without diff confirmation |
 
@@ -363,11 +395,12 @@ OpenAI-compatible Chat Completions (provider swappable via base URL + model env)
 
 One logical “fix” request per failed iteration (classification can be the same call that returns a patch or `escalate`).
 
-#### External: Docker (outbound local)
+#### External: act + Docker (outbound local)
 
-Not REST in our public API sense — `executor` talks to the local Docker Engine (SDK or `docker` CLI wrapper):
+Not REST in our public API sense — `ActExecutor` invokes **nektos/act**, which talks to the local Docker Engine:
 
-- create/start container, bind-mount repo, set env, attach logs, wait, remove
+- act plans/runs the selected GitHub Actions job (including `uses:` / `run:` / conditionals as act supports)
+- Docker creates containers, mounts workspace, streams logs; we capture a capped tail into `RunResult`
 
 #### Not in MVP
 
@@ -434,7 +467,7 @@ type LLMClient interface {
 | Surface | Auth |
 |---------|------|
 | CLI | None (local process; user already has filesystem access) |
-| Docker Engine | Local daemon access (default socket / Docker context); no PipeDebug-managed credentials |
+| Docker Engine (via act) | Local daemon access (default socket / Docker context); no PipeDebug-managed credentials |
 | LLM API | API key via env, e.g. `PIPEDEBUG_LLM_API_KEY` (or provider-specific); optional `PIPEDEBUG_LLM_BASE_URL`, `PIPEDEBUG_LLM_MODEL` |
 | Secrets for CI steps | User-supplied `--env-file` / flags; injected into container only; never sent to the LLM or written to the journal |
 
@@ -473,7 +506,7 @@ type Config struct {
 }
 ```
 
-Flow: `main` → `ParseConfig(os.Args)` → validate (job required if ambiguous, AI implies API key present, etc.) → construct `DockerRunner` / `LLM` / `Patcher` / `Journal` → `loop.Run(ctx, job, cfg)`.
+Flow: `main` → `ParseConfig(os.Args)` → validate (job required if ambiguous, AI implies API key present, etc.) → construct `ActExecutor` / `LLM` / `Patcher` / `Journal` → `loop.Run(ctx, job, cfg)`.
 
 ### Module diagrams
 
@@ -484,9 +517,13 @@ pipedebug/
 ├── cmd/pipedebug/
 │   ├── main.go          # wire deps, map errors → exit codes
 │   └── config.go        # ParseConfig / validation (CLI boundary)
+├── docs/
+│   ├── PRD.md
+│   ├── USER_STORIES.md
+│   └── TECHNICAL_DESIGN.md
 ├── internal/
-│   ├── parser/          # YAML → Job (+ runs-on → image helpers)
-│   ├── executor/        # Executor interface + DockerRunner
+│   ├── parser/          # GHA detect + workflow/job select (+ optional actionlint)
+│   ├── executor/        # Executor interface + ActExecutor (nektos/act)
 │   ├── llm/             # LLMClient interface + HTTP impl
 │   ├── patcher/         # apply / rollback diffs
 │   ├── journal/         # append history.md
@@ -494,7 +531,7 @@ pipedebug/
 └── go.mod
 ```
 
-Shared types (`Job`, `Step`, `RunResult`, `PatchProposal`) live next to owners or a tiny `internal/types` only if import cycles force it—no `domain` / `failure` / `scopegate` layers.
+Shared types (`Job`, `RunResult`, `PatchProposal`) live next to owners or a tiny `internal/types` only if import cycles force it—no `domain` / `failure` / `scopegate` layers. `Step` is optional metadata for UX/LLM, not required for act to execute.
 
 #### Module dependency diagram
 
@@ -502,7 +539,7 @@ Shared types (`Job`, `Step`, `RunResult`, `PatchProposal`) live next to owners o
 flowchart TB
   cmd[cmd/pipedebug<br/>ParseConfig → Config]
   parser[internal/parser]
-  exec[internal/executor<br/>DockerRunner]
+  exec[internal/executor<br/>ActExecutor]
   llm[internal/llm]
   patch[internal/patcher]
   journal[internal/journal]
@@ -537,13 +574,8 @@ classDiagram
 
   class Job {
     +Name string
+    +WorkflowPath string
     +Image string
-    +Steps []Step
-  }
-
-  class Step {
-    +Name string
-    +Run string
   }
 
   class RunResult {
@@ -564,8 +596,8 @@ classDiagram
     +Run(ctx, Job) RunResult
   }
 
-  class DockerRunner {
-    -docker DockerAPI
+  class ActExecutor {
+    -actOpts ...
     -repoDir string
     -envFile string
     -verbose bool
@@ -594,29 +626,28 @@ classDiagram
     +Run(ctx, Job, Config) error
   }
 
-  Job "1" *-- "*" Step
-  DockerRunner ..|> Executor
+  ActExecutor ..|> Executor
   Loop --> Executor
   Loop --> LLMClient
   Loop --> Patcher
   Loop --> Journal
   Loop --> Config : reads options
-  DockerRunner --> RunResult : produces
+  ActExecutor --> RunResult : produces
   LLMClient --> PatchProposal : produces
   Patcher --> PatchProposal : applies
 ```
 
-`DockerRunner` (not a vague “handler”) owns all Docker Engine interaction: create/start container, bind-mount `Config.RepoDir`, inject env from `Config.EnvFile`, stream step output into a private capped tail, return `RunResult`. Tests inject a fake `Executor` instead.
+`ActExecutor` owns invoking nektos/act for `Job` (workflow + job id + overrides), streaming output into a private capped tail, and returning `RunResult`. Tests inject a fake `Executor` instead of calling act.
 
-**Still omitted (details, not architecture):** private log-tail buffer inside `DockerRunner`; separate `FailureArtifact` type; interface wrappers for `Patcher` / `Journal`.
+**Still omitted (details, not architecture):** exact act library vs CLI wiring; private log-tail buffer; separate `FailureArtifact` type; interface wrappers for `Patcher` / `Journal`.
 
 #### Key behaviors
 
 | Component | Behavior |
 |-----------|----------|
 | `cmd` / `Config` | Parse + validate CLI/env once; wire concrete deps; set exit codes |
-| `parser` | Workflow YAML → `Job`; apply `--image` override from `Config` when set |
-| `DockerRunner` | Execute `Job` in Docker with parity mounts/env; capped tail; log UX |
+| `parser` | Detect GHA workflows; select workflow/job → `Job`; optional actionlint; map overrides for act |
+| `ActExecutor` | Run job via act; capped tail; log UX; map pass/fail |
 | `llm` | Tail + snippets → `fix` + diffs or `escalate` |
 | `patcher` | Allowlisted apply / rollback |
 | `loop` | Iterations + stop conditions; journal once at end |
@@ -663,7 +694,7 @@ This product scales with **developer machines and repo size**, not request QPS.
 | Git | Never auto-commit or push; user reviews `git diff` |
 | API keys | LLM key via env only; not logged; not echoed in verbose output |
 | Docker trust | Runs with the privileges of the local Docker daemon/user—document that malicious CI YAML can execute as whatever the mounted workspace + container user allows (same class of risk as running CI locally) |
-| Supply chain | Pin Go module versions; prefer Docker Engine API over shelling unsanitized strings where practical |
+| Supply chain | Pin Go module versions; treat act args/paths carefully; prefer library integration over unsanitized shell strings where practical |
 
 ### Reliability
 
@@ -695,7 +726,8 @@ What “deploy” means here: **build and distribute a Go binary**, plus documen
 
 **Host prerequisites**
 - Docker Engine (daemon running)
-- Network access to pull runner images (first run) and to the LLM API when AI is enabled
+- nektos/act available (bundled/library dependency preferred; document CLI fallback if used)
+- Network access to pull runner/action images (first run) and to the LLM API when AI is enabled
 - LLM API key in env when not using `--no-ai`
 
 ### CI/CD
@@ -729,44 +761,46 @@ PipeDebug does not deploy customer apps; it only helps debug *their* pipelines l
 | Topic | Alternatives | Choice | Why |
 |-------|--------------|--------|-----|
 | Language | TypeScript, Python | **Go** | Single static binary, solid Docker/HTTP ecosystem, strong CLI signal |
+| CI providers | Multi-provider MVP (GHA + GitLab + CircleCI) | **GitHub Actions only**; `Executor` seam for later | Resume focus; shipping one solid path beats thin multi-provider stubs |
+| Job execution | Custom Docker step runner; wrap act | **Wrap nektos/act** behind `Executor` | act owns Actions parity (`uses`/`if`/…); our novel value is the AI fix loop |
 | UI | Web dashboard, TUI | **CLI only** | Core loop is terminal feedback; a SPA dilutes scope without helping demos much |
 | Persistence | SQLite / full log archive | **Markdown journal + in-memory log tail** | Tiny footprint; enough history without a DB |
 | Log capture | Full temp spool + ring buffer | **Capped in-memory tail only** | Dual spool was overkill for MVP; failures show up in the tail |
 | Patch isolation | Git worktree / scratch branch | **Edit working tree + no auto-commit** | Simpler mental model; user owns `git diff` / commit |
-| Docker access | Shell out to `docker` only | **Engine API preferred** (CLI wrapper acceptable) | Cleaner control of mounts/logs; still mockable behind `Executor` |
 | LLM scope gate | Separate classifier service/package | **`fix` \| `escalate` in one LLM response** + allowlist in `patcher` | Fewer moving parts |
 | CLI parsing | Custom `ArgParser` package / scattered `os.Args` | **`Config` parsed once in `cmd`** (`flag` → Cobra when subcommands land) | Standard Go CLI shape |
+| Workflow validate | Hand-roll Actions grammar; skip lint | **Job select + optional actionlint**; execution via act | Don’t own the runner or the full grammar |
 | Hosted product | SaaS runner / remote agents | **Local-only** | Matches the problem (parity on your machine); no cloud deploy surface |
 
 ### Risks & mitigations
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| Incomplete parity with GitHub-hosted runners | Local green ≠ remote green (or the reverse) | MVP focuses on `run:` steps; document gaps (marketplace actions, OIDC, services); optional image override |
+| Incomplete parity with GitHub-hosted runners | Local green ≠ remote green (or the reverse) | Rely on act; document act/GHA gaps (OIDC, some services, etc.); optional image override |
+| act API / CLI churn | Integration breaks | Pin act version; keep a thin `ActExecutor` adapter; tests with fake `Executor` for the loop |
 | LLM changes architecture or over-edits | Bad diffs, lost trust | Prompt rules + `escalate` path + path allowlist + `--max-iterations` + no auto-commit |
 | Secrets leak to LLM or journal | Security incident | Never put env-file values in prompts or history rows; only log tails + code snippets |
-| Malicious/unsafe CI YAML locally | Arbitrary code as Docker user | Same class of risk as “run CI locally”; document clearly; don’t escalate privileges |
+| Malicious/unsafe CI YAML locally | Arbitrary code as Docker user | Same class of risk as `act` / local CI; document clearly; don’t escalate privileges |
 | Huge step logs | Memory pressure / useless LLM context | Capped tail buffer; send only that tail + small snippets |
-| Unsupported YAML silently mis-run | False confidence | Fail loudly at parse time for unsupported features |
-| Docker daemon missing / pull failures | Tool unusable | Exit `3` with actionable errors; P1 `doctor` |
+| Docker/act missing or pull failures | Tool unusable | Exit `3` with actionable errors; P1 `doctor` checks Docker + act |
 | LLM outage / bad JSON | Loop stuck or broken tree | Timeout; stop loop; rollback failed applies; `--no-ai` escape hatch |
 | Patch apply leaves dirty tree | User frustration | Atomic-enough apply + rollback on failure / non-improvement |
 
 ### Known limitations
 
-- **Not a replacement for hosted CI** — merges/deploys still go through GitHub Actions / GitLab / CircleCI
-- **GitHub Actions MVP** — marketplace actions, complex `services:`, matrix strategy, and reusable workflows are limited or unsupported initially
-- **Parity is approximate** — runner images and preinstalled tools won’t match GitHub’s VM identically
+- **GitHub Actions only** — no GitLab/CircleCI in this project; architecture can accept another `Executor` later
+- **Not a replacement for hosted CI** — merges/deploys still go through GitHub Actions
+- **Parity bounded by act** — whatever act cannot emulate, we cannot either; document those gaps
 - **One job per invocation** — no full workflow graph / parallel jobs in MVP
 - **AI fixes are best-effort** — minor errors only; architectural and ambiguous failures escalate
 - **No dashboard / remote run compare** in this build
 - **No full log retention** — only capped tails unless a later opt-in is added
-- **Requires Docker + (for AI) an LLM API key and network**
+- **Requires Docker + act + (for AI) an LLM API key and network**
 - **Patches modify the working tree** — concurrent edits by the user during a run can conflict (don’t run against a tree you’re actively rewriting)
 
 ### Open decisions (non-blocking for MVP)
 
-1. Docker Engine SDK vs `docker` CLI wrapper for v1 implementation speed
-2. How much of the Actions marketplace to stub vs. require equivalent `run:` scripts
-3. Whether step-through (P1) reuses one long-lived container or recreates per step
+1. act as Go library import vs shell out to `act` CLI for v1 speed
+2. How much failed-step parsing to do from act logs vs “whole job failed + tail”
+3. Whether step-through (P1) is feasible on top of act or deferred
 4. Cloud LLM only vs. optional local model (Ollama) later
