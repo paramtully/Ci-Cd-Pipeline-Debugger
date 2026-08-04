@@ -34,3 +34,6 @@ go.work.sum
 
 # graphify generated outputs
 graphify-out/
+
+# pipedebug local run journal
+.pipedebug/
